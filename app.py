@@ -1,11 +1,7 @@
 """
-Resume Scoring & Job Filtering Platform — Flask API
-=====================================================
-Endpoints:
-  POST /predict        — Score a single resume vs job
-  POST /rank           — Rank multiple resumes for one job
-  POST /shortlist      — Shortlist candidates (3-tier)
-  GET  /health         — API health check
+Resume Scoring & Job Filtering Platform — Flask API 
+======================================================
+Improved score differentiation using penalty logic
 """
 
 from flask import Flask, request, jsonify
@@ -17,20 +13,17 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 app = Flask(__name__)
 
-# ── Load model files ────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(BASE_DIR, 'models')
 
-model     = pickle.load(open(os.path.join(MODEL_DIR, 'model.pkl'), 'rb'))
-scaler    = pickle.load(open(os.path.join(MODEL_DIR, 'scaler.pkl'), 'rb'))
+model      = pickle.load(open(os.path.join(MODEL_DIR, 'model.pkl'), 'rb'))
+scaler     = pickle.load(open(os.path.join(MODEL_DIR, 'scaler.pkl'), 'rb'))
 tfidf_main = pickle.load(open(os.path.join(MODEL_DIR, 'tfidf_main.pkl'), 'rb'))
 tfidf_cos  = pickle.load(open(os.path.join(MODEL_DIR, 'tfidf_cos.pkl'), 'rb'))
 
-# ── Thresholds ───────────────────────────────────────────────
 THRESHOLD_STRONG = 0.75
 THRESHOLD_MAYBE  = 0.60
 
-# ── Helper functions ─────────────────────────────────────────
 def clean_text(text):
     if not text: return ""
     text = str(text).lower()
@@ -39,242 +32,203 @@ def clean_text(text):
 
 def education_score(text):
     text = str(text).lower()
-    if any(kw in text for kw in ['phd', 'ph.d', 'doctorate']):       return 4
+    if any(kw in text for kw in ['phd', 'ph.d', 'doctorate']):              return 4
     if any(kw in text for kw in ['master', 'm.sc', 'mba', 'msc', 'm.tech']): return 3
     if any(kw in text for kw in ['bachelor', 'b.sc', 'bsc', 'b.tech', 'btech', 'honours']): return 2
-    if any(kw in text for kw in ['diploma', 'associate']):            return 1
+    if any(kw in text for kw in ['diploma', 'associate']):                   return 1
     return 0
 
-def get_shortlist_label(score):
+def apply_penalty(base_score, skills, skills_required):
+    """
+    Penalty logic — differentiates scores better:
+    - No skill match at all → heavy penalty
+    - Missing critical skills → medium penalty
+    - Good skill match → bonus
+    """
+    if not skills_required:
+        return base_score
+
+    s = set(x.lower().strip() for x in skills)
+    r = set(x.lower().strip() for x in skills_required)
+    overlap = s & r
+    overlap_ratio = len(overlap) / len(r) if r else 0
+    missing_ratio = len(r - s) / len(r) if r else 0
+
+    score = base_score
+
+    # Heavy penalty — zero skill match
+    if overlap_ratio == 0:
+        score = score * 0.55
+
+    # Medium penalty — less than 30% skills match
+    elif overlap_ratio < 0.30:
+        score = score * (0.65 + overlap_ratio * 0.35)
+
+    # Slight penalty — 30-60% match
+    elif overlap_ratio < 0.60:
+        score = score * (0.80 + overlap_ratio * 0.20)
+
+    # Bonus — more than 80% skills match
+    elif overlap_ratio >= 0.80:
+        score = min(score * 1.10, 1.0)
+
+    return float(np.clip(score, 0, 1))
+
+def get_label(score):
     if score >= THRESHOLD_STRONG: return 'Strong Match'
     if score >= THRESHOLD_MAYBE:  return 'Maybe'
     return 'Not Shortlisted'
 
-def extract_features(resume_text, job_text, skills=None, skills_required=None):
-    """Extract all features for a resume-job pair"""
-    resume_clean = clean_text(resume_text)
-    job_clean    = clean_text(job_text)
-    combined     = resume_clean + ' ' + job_clean
+def predict_score(resume_text, job_text, skills=None, skills_required=None):
+    rc = clean_text(resume_text)
+    jc = clean_text(job_text)
+    combined = rc + ' ' + jc
 
-    # 1. TF-IDF Cosine Similarity
-    r_vec = tfidf_cos.transform([resume_clean])
-    j_vec = tfidf_cos.transform([job_clean])
-    cos_sim = cosine_similarity(r_vec, j_vec)[0][0]
+    cos_sim = cosine_similarity(tfidf_cos.transform([rc]), tfidf_cos.transform([jc]))[0][0]
 
-    # 2. Skill Features
     s = set(x.lower().strip() for x in (skills or []))
     r = set(x.lower().strip() for x in (skills_required or []))
     ov = s & r
-    skill_overlap_count  = len(ov)
-    skill_overlap_ratio  = len(ov) / len(r) if r else 0
-    candidate_skill_count = len(s)
-    required_skill_count  = len(r)
-    missing_skills = len(r - s)
-    extra_skills   = len(s - r)
 
-    # 3. Text Stats
-    r_words = set(resume_clean.split())
-    j_words = set(job_clean.split())
-    resume_word_count = len(resume_clean.split())
-    common_word_ratio = len(r_words & j_words) / max(len(j_words), 1)
+    r_words = set(rc.split())
+    j_words = set(jc.split())
+    jtw = set(jc.split()[:5])
+    jtm = sum(1 for w in jtw if w in rc and len(w) > 2) / max(5, 1)
+    re_edu = education_score(resume_text)
+    je_edu = education_score(job_text)
 
-    # 4. Job Title Match
-    job_title_words = set(job_clean.split()[:5])
-    job_title_match = sum(1 for w in job_title_words if w in resume_clean and len(w) > 2) / max(5, 1)
-
-    # 5. Education
-    resume_edu = education_score(resume_text)
-    job_edu    = education_score(job_text)
-    edu_match  = int(resume_edu >= job_edu)
-
-    # 6. Combine all
-    semantic = np.array([[
-        cos_sim, skill_overlap_count, skill_overlap_ratio,
-        candidate_skill_count, required_skill_count,
-        missing_skills, extra_skills, resume_word_count,
-        common_word_ratio, job_title_match,
-        resume_edu, job_edu, edu_match
+    sem = np.array([[
+        cos_sim, len(ov), len(ov)/len(r) if r else 0,
+        len(s), len(r), len(r-s), len(s-r),
+        len(rc.split()),
+        len(r_words & j_words) / max(len(j_words), 1),
+        jtm, re_edu, je_edu, int(re_edu >= je_edu)
     ]])
     tfidf_vec = tfidf_main.transform([combined]).toarray()
-    features = np.hstack([semantic, tfidf_vec])
-    return scaler.transform(features)
+    features  = np.hstack([sem, tfidf_vec])
+    base_score = float(np.clip(model.predict(scaler.transform(features))[0], 0, 1))
 
-def predict_score(resume_text, job_text, skills=None, skills_required=None):
-    features = extract_features(resume_text, job_text, skills, skills_required)
-    score = float(np.clip(model.predict(features)[0], 0, 1))
-    return score
+    # Apply penalty for better differentiation
+    final_score = apply_penalty(base_score, skills or [], skills_required or [])
+    return final_score
 
 
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 # ENDPOINT 1 — /predict
-# Score a single resume against a job
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 @app.route('/predict', methods=['POST'])
 def predict():
-    """
-    Request body:
-    {
-        "resume_text": "...",
-        "job_text": "...",
-        "skills": ["Python", "SQL"],           # optional
-        "skills_required": ["Python", "AWS"]   # optional
-    }
-    """
     data = request.get_json()
-
     if not data or 'resume_text' not in data or 'job_text' not in data:
-        return jsonify({'error': 'resume_text and job_text are required'}), 400
+        return jsonify({'error': 'resume_text and job_text required'}), 400
 
     score = predict_score(
-        data['resume_text'],
-        data['job_text'],
-        data.get('skills', []),
-        data.get('skills_required', [])
+        data['resume_text'], data['job_text'],
+        data.get('skills', []), data.get('skills_required', [])
     )
 
-    label = get_shortlist_label(score)
-
-    # Skill gap analysis
     s = set(x.lower().strip() for x in data.get('skills', []))
     r = set(x.lower().strip() for x in data.get('skills_required', []))
-    missing = list(r - s)
-    matched = list(s & r)
 
     return jsonify({
         'score': round(score, 4),
         'percentage': f"{score*100:.1f}%",
-        'shortlist_label': label,
+        'shortlist_label': get_label(score),
         'skill_analysis': {
-            'matched_skills': matched,
-            'missing_skills': missing,
+            'matched_skills': list(s & r),
+            'missing_skills': list(r - s),
             'match_ratio': round(len(s&r)/len(r), 3) if r else None
         }
     })
 
 
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 # ENDPOINT 2 — /rank
-# Rank multiple resumes for one job (recruiter view)
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 @app.route('/rank', methods=['POST'])
 def rank():
-    """
-    Request body:
-    {
-        "job_text": "...",
-        "skills_required": ["Python", "SQL"],
-        "resumes": [
-            {"id": "r1", "resume_text": "...", "skills": ["Python"]},
-            {"id": "r2", "resume_text": "...", "skills": ["Java"]},
-            ...
-        ]
-    }
-    """
     data = request.get_json()
-
     if not data or 'job_text' not in data or 'resumes' not in data:
-        return jsonify({'error': 'job_text and resumes are required'}), 400
+        return jsonify({'error': 'job_text and resumes required'}), 400
 
     job_text        = data['job_text']
     skills_required = data.get('skills_required', [])
-    resumes         = data['resumes']
-
-    if len(resumes) == 0:
-        return jsonify({'error': 'At least 1 resume required'}), 400
-
     results = []
-    for resume in resumes:
+
+    for resume in data['resumes']:
         score = predict_score(
-            resume.get('resume_text', ''),
-            job_text,
-            resume.get('skills', []),
-            skills_required
+            resume.get('resume_text', ''), job_text,
+            resume.get('skills', []), skills_required
         )
         results.append({
             'id': resume.get('id', 'unknown'),
             'score': round(score, 4),
             'percentage': f"{score*100:.1f}%",
-            'shortlist_label': get_shortlist_label(score)
+            'shortlist_label': get_label(score)
         })
 
-    # Sort by score descending
     results.sort(key=lambda x: x['score'], reverse=True)
     for i, r in enumerate(results, 1):
         r['rank'] = i
 
-    summary = {
-        'total_resumes': len(results),
-        'strong_match': sum(1 for r in results if r['shortlist_label'] == 'Strong Match'),
-        'maybe': sum(1 for r in results if r['shortlist_label'] == 'Maybe'),
-        'not_shortlisted': sum(1 for r in results if r['shortlist_label'] == 'Not Shortlisted'),
-        'top_candidate_id': results[0]['id'] if results else None
-    }
-
     return jsonify({
-        'summary': summary,
+        'summary': {
+            'total_resumes': len(results),
+            'strong_match':     sum(1 for r in results if r['shortlist_label'] == 'Strong Match'),
+            'maybe':            sum(1 for r in results if r['shortlist_label'] == 'Maybe'),
+            'not_shortlisted':  sum(1 for r in results if r['shortlist_label'] == 'Not Shortlisted'),
+            'top_candidate_id': results[0]['id'] if results else None
+        },
         'ranked_resumes': results
     })
 
 
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 # ENDPOINT 3 — /shortlist
-# Just return shortlisted candidates above threshold
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 @app.route('/shortlist', methods=['POST'])
 def shortlist():
-    """
-    Same as /rank but returns only shortlisted candidates
-    Optional: custom threshold
-    {
-        "job_text": "...",
-        "skills_required": [...],
-        "threshold": 0.65,         # optional, default 0.60
-        "resumes": [...]
-    }
-    """
     data = request.get_json()
-
     if not data or 'job_text' not in data or 'resumes' not in data:
-        return jsonify({'error': 'job_text and resumes are required'}), 400
+        return jsonify({'error': 'job_text and resumes required'}), 400
 
-    threshold = float(data.get('threshold', THRESHOLD_MAYBE))
-    job_text  = data['job_text']
+    threshold       = float(data.get('threshold', THRESHOLD_MAYBE))
+    job_text        = data['job_text']
     skills_required = data.get('skills_required', [])
-
     results = []
+
     for resume in data['resumes']:
         score = predict_score(
-            resume.get('resume_text', ''),
-            job_text,
-            resume.get('skills', []),
-            skills_required
+            resume.get('resume_text', ''), job_text,
+            resume.get('skills', []), skills_required
         )
         if score >= threshold:
             results.append({
                 'id': resume.get('id', 'unknown'),
                 'score': round(score, 4),
                 'percentage': f"{score*100:.1f}%",
-                'shortlist_label': get_shortlist_label(score)
+                'shortlist_label': get_label(score)
             })
 
     results.sort(key=lambda x: x['score'], reverse=True)
 
     return jsonify({
-        'threshold_used': threshold,
-        'total_submitted': len(data['resumes']),
-        'total_shortlisted': len(results),
+        'threshold_used':        threshold,
+        'total_submitted':       len(data['resumes']),
+        'total_shortlisted':     len(results),
         'shortlisted_candidates': results
     })
 
 
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 # ENDPOINT 4 — /health
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({
         'status': 'ok',
         'model': 'GradientBoostingRegressor',
+        'version': 'v2 - with penalty logic',
         'features': 513,
         'thresholds': {
             'strong_match': THRESHOLD_STRONG,
