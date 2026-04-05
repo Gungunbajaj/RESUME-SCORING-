@@ -14,7 +14,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 app = Flask(__name__)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_DIR = os.path.join(BASE_DIR, 'models')
+MODEL_DIR = BASE_DIR
 
 model      = pickle.load(open(os.path.join(MODEL_DIR, 'model.pkl'), 'rb'))
 scaler     = pickle.load(open(os.path.join(MODEL_DIR, 'scaler.pkl'), 'rb'))
